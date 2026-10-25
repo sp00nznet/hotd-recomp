@@ -42,7 +42,14 @@ MODULES = [
 ]
 
 # Entries the catalogs do not find, so a clean checkout lifts them too.
-RUN_SEEDS = []
+# Each was an "ICALL: unresolved VA" in a run (tools/seed_from_log.py): reached
+# only through a pointer the catalog doesn't see. Without 0x0057DC20 the game
+# takes another path at boot and quits.
+RUN_SEEDS = [
+    0x00418C94, 0x0041DCCC,              # window-message handlers
+    0x0045AF50, 0x0046EA58, 0x00480654, 0x0048793C,   # scheduler tasks
+    0x0057DC20,                          # a library routine the boot calls through a table
+]
 
 # Data Watcom linked into BEGTEXT after the last function (ret at 0x00595A2B):
 # 256 16-byte records from 0x00595A30, then a header that points back at them;

@@ -29,6 +29,8 @@
 #include "recomp_trace.h"
 #include "ddraw_window.h"
 #include "menu.h"
+#include "net.h"
+#include "net.h"
 
 extern const uint32_t hotd_entry_va;  /* recomp_dispatch.c */
 
@@ -115,6 +117,7 @@ static void shim_CreateWindowExA(void) {
          * procedure is guest code: Windows' call to it faults on the
          * non-executable page and native32 runs the lifted body. */
         g_game_proc = (WNDPROC)SetWindowLongPtrA(h, GWLP_WNDPROC, (LONG_PTR)host_wndproc);
+        net_set_window(h);
     }
     printf("[host] CreateWindowExA(\"%s\", %dx%d) -> %p (error %lu)\n",
            ARG(2) && HIWORD(ARG(2)) ? (const char*)(uintptr_t)ARG(2) : "", (int)ARG(6), (int)ARG(7), (void*)h, err);
@@ -440,6 +443,29 @@ static void shim_GlobalDeleteAtom(void) {
     g_esp += 4 + 1 * 4;
 }
 
+/* Its other one-instance checks: FindWindowA for another copy's window (found,
+ * it quits at once) and a named mutex. Two copies on one PC are how online
+ * play is tried out, so each sees only its own windows and its own mutexes. */
+static void shim_FindWindowA(void) {
+    HWND w = FindWindowA((LPCSTR)(uintptr_t)ARG(0), (LPCSTR)(uintptr_t)ARG(1));
+    DWORD pid = 0;
+    if (w) GetWindowThreadProcessId(w, &pid);
+    g_eax = pid == GetCurrentProcessId() ? (uint32_t)(uintptr_t)w : 0;
+    g_esp += 4 + 2 * 4;
+}
+
+static void shim_CreateMutexA(void) {
+    const char* name = (const char*)(uintptr_t)ARG(2);
+    char own[MAX_PATH];
+    if (name) {
+        _snprintf(own, sizeof own - 1, "%s.%lu", name, GetCurrentProcessId());
+        own[sizeof own - 1] = 0;
+        name = own;
+    }
+    g_eax = (uint32_t)(uintptr_t)CreateMutexA((LPSECURITY_ATTRIBUTES)(uintptr_t)ARG(0), (BOOL)ARG(1), name);
+    g_esp += 4 + 3 * 4;
+}
+
 /* ---- Watcom's longjmp --------------------------------------------------------
  * The game runs its tasks under a setjmp in sub_0043E354; a task ends with
  * longjmp(buf, 3), or 2 to run again. run_lift.py patches the first
@@ -593,6 +619,8 @@ static native32_shim_t g_shims[] = {
     { "GlobalAddAtomA", shim_GlobalAddAtomA },
     { "GlobalFindAtomA", shim_GlobalFindAtomA },
     { "GlobalDeleteAtom", shim_GlobalDeleteAtom },
+    { "FindWindowA", shim_FindWindowA },
+    { "CreateMutexA", shim_CreateMutexA },
     { "CreateWindowExA", shim_CreateWindowExA },
     { "ShowWindow", shim_ShowWindow },
     { "SetWindowPos", shim_SetWindowPos },
@@ -718,7 +746,8 @@ int main(int argc, char** argv) {
     const char* exe = "work\\thotd.exe";
     const char* game = "game";
     char exe_full[MAX_PATH], game_full[MAX_PATH], guest_args[512] = "";
-    int run = 0, sound = 0;
+    int run = 0, sound = 0, net_host_port = 0, net_test = 0;
+    const char* net_join_addr = NULL;
     /* A fault ends the run with TerminateProcess: nothing buffered may be lost. */
     setvbuf(stdout, NULL, _IONBF, 0);
     run_seconds();                      /* the clock starts with the host */
@@ -737,9 +766,13 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--watchdog") && i + 1 < argc) g_watchdog_s = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--pad") && i + 1 < argc) GetFullPathNameA(argv[++i], MAX_PATH, g_pad, NULL);
         else if (!strcmp(argv[i], "--callbacks")) native32_trace_callbacks = 1;
+        else if (!strcmp(argv[i], "--host")) net_host_port = i + 1 < argc && atoi(argv[i + 1]) ? atoi(argv[++i]) : -1;
+        else if (!strcmp(argv[i], "--join") && i + 1 < argc) net_join_addr = argv[++i];
+        else if (!strcmp(argv[i], "--net-selftest")) net_test = 1;
         else {
             printf("usage: hotd [--run] [--headless] [--record out.mp4] [--fullscreen] [--sound] [--exe work\\thotd.exe]\n"
-                   "            [--game game] [--args \"<game switches>\"] [--watchdog S] [--pad FILE] [--callbacks]\n");
+                   "            [--game game] [--args \"<game switches>\"] [--watchdog S] [--pad FILE] [--callbacks]\n"
+                   "            [--host [PORT]] [--join CODE|ADDR[:PORT]] [--net-selftest] [--cmd NAME@SECONDS]\n");
             recomp_trace_help();
             return argv[i][1] == 'h' || argv[i][2] == 'h' ? 0 : 1;
         }
@@ -766,6 +799,11 @@ int main(int argc, char** argv) {
     printf("  mapped %s: 0x%08X-0x%08X\n", exe, HOTD_IMAGE_BASE, HOTD_IMAGE_BASE + span);
     if (native32_bind(HOTD_IMAGE_BASE, g_shims, (int)(sizeof g_shims / sizeof g_shims[0]))) return 1;
     printf("  guest command line %s\n", g_guest_cmdline);
+    /* Online play: the build is the exe's PE stamp, so both PCs run the same game. */
+    net_init(NULL, MEM32(HOTD_IMAGE_BASE + MEM32(HOTD_IMAGE_BASE + 0x3C) + 8), g_headless);
+    if (net_test) return net_selftest();
+    if (net_host_port) net_host(net_host_port > 0 ? net_host_port : 0);
+    if (net_join_addr) net_join(net_join_addr);
 
     if (!run) {
         printf("\n(dry run: image mapped and bound; --run enters 0x%08X)\n", hotd_entry_va);
