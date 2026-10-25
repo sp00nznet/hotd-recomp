@@ -49,6 +49,9 @@ RUN_SEEDS = [
     0x00418C94, 0x0041DCCC,              # window-message handlers
     0x0045AF50, 0x0046EA58, 0x00480654, 0x0048793C,   # scheduler tasks
     0x0057DC20,                          # a library routine the boot calls through a table
+    # Callbacks Windows calls (a window procedure set with SetWindowLongA):
+    # before pcrecomp#128 these ran as the original machine code unnoticed.
+    0x00567720,
 ]
 
 # Data Watcom linked into BEGTEXT after the last function (ret at 0x00595A2B):
