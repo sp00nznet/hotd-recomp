@@ -52,12 +52,20 @@ heap) and the game's random seed; a mismatch ends the session on both PCs and
 says so. `--desync-test FRAME` makes one PC's hash lie from that frame on: the
 check's own test.
 
-**Tested** with two copies on one PC over localhost, each with its own game
-folder, headless and scripted (`tools\drive.ps1` with
-`tools\scripts\arcade-shoot.txt` on the host and `p2-long.txt` on the joiner):
-both players in Arcade mode, shooting, for 3,000+ frames with every check in
-agreement; the deliberate desync caught at its frame on both; the host's cheat
-mode on both. Not yet: two PCs on a real network, and a long session.
+**Tested:**
+
+- **Two PCs, through a NAT** (netlab, 2026-10-25): a Windows workstation
+  hosting on the LAN, a Windows VM behind a home-router-style NAT joining, both
+  headless and scripted (the host playing Arcade, player 2 joining in and
+  shooting through its input mailbox). Twice for 300 s: every check in
+  agreement through frame 2,400, player 2's HUD and crosshair on the host's
+  picture. The VM has no audio device and no GPU: alone it runs the game at
+  about 15 fps, and the pair ran at about 11, the slower PC's pace.
+- **Two copies on one PC** over localhost, each with its own game folder
+  (`tools\drive.ps1` with `tools\scripts\arcade-shoot.txt` on the host and
+  `p2-long.txt` on the joiner): 5,400 frames in agreement with both shooting
+  and cheat mode on; the deliberate desync caught at its frame on both.
+- Not yet: a session over the internet, or a long one.
 
 **Limits.** Two players (the game has two seats). A session starts at the
 game's first frame on both PCs; joining a game already running would need the

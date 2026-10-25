@@ -640,6 +640,88 @@ static void shim_CreateMutexA(void) {
     g_esp += 4 + 3 * 4;
 }
 
+/* ---- no sound device ----------------------------------------------------------
+ * The game keeps its DirectSound object at [0x00C67FDC] and calls through it
+ * without checking: if the primary buffer can't be made it drops the object
+ * (sub_0057C780), but its sound loads go on and read a null vtable
+ * (sub_0057C0E0). So on a PC with no audio device (a test VM, a server) it
+ * gets a silent DirectSound that works: buffers take any format and data,
+ * lock into memory of their own, and play at a position that moves with the
+ * clock. */
+typedef struct { const void* const* vtbl; DWORD size; uint8_t* mem; DWORD t0; } nobuf_t;
+static const void* const g_nobuf_vtbl[21];
+
+static HRESULT WINAPI nb_qi(void* s, REFIID r, void** o) { (void)s, (void)r; if (o) *o = NULL; return E_NOINTERFACE; }
+static ULONG WINAPI nb_ref(void* s) { (void)s; return 1; }   /* ponytail: never freed; a few per game */
+static HRESULT WINAPI nb_caps(nobuf_t* b, DWORD* c) {        /* DSBCAPS: size, flags, bytes, ... */
+    if (c && c[0] >= 12) { memset(c + 1, 0, c[0] - 4); c[2] = b->size; }
+    return 0;
+}
+static HRESULT WINAPI nb_pos(nobuf_t* b, DWORD* play, DWORD* write) {
+    DWORD p = b->size ? (GetTickCount() - b->t0) * 176u % b->size : 0;   /* ~44.1 kHz 16-bit stereo */
+    if (play) *play = p;
+    if (write) *write = p;
+    return 0;
+}
+static HRESULT WINAPI nb_fmt(void* s, void* f, DWORD n, DWORD* w) { (void)s; if (f && n) memset(f, 0, n); if (w) *w = 0; return 0; }
+static HRESULT WINAPI nb_get1(void* s, DWORD* v) { (void)s; if (v) *v = 0; return 0; }
+static HRESULT WINAPI nb_init(void* s, void* d, void* e) { (void)s, (void)d, (void)e; return 0; }
+static HRESULT WINAPI nb_lock(nobuf_t* b, DWORD off, DWORD n, void** p1, DWORD* n1, void** p2, DWORD* n2, DWORD fl) {
+    (void)off;
+    if (fl & 2 /* DSBLOCK_ENTIREBUFFER */ || n > b->size) n = b->size;
+    if (p1) *p1 = b->mem;
+    if (n1) *n1 = n;
+    if (p2) *p2 = NULL;
+    if (n2) *n2 = 0;
+    return 0;
+}
+static HRESULT WINAPI nb_play(void* s, DWORD a, DWORD b, DWORD c) { (void)s, (void)a, (void)b, (void)c; return 0; }
+static HRESULT WINAPI nb_set1(void* s, DWORD v) { (void)s, (void)v; return 0; }
+static HRESULT WINAPI nb_stop(void* s) { (void)s; return 0; }
+static HRESULT WINAPI nb_unlock(void* s, void* a, DWORD b, void* c, DWORD d) { (void)s, (void)a, (void)b, (void)c, (void)d; return 0; }
+static const void* const g_nobuf_vtbl[21] = {
+    nb_qi, nb_ref, nb_ref, nb_caps, nb_pos, nb_fmt, nb_get1, nb_get1, nb_get1, nb_get1,   /* ...GetStatus */
+    nb_init, nb_lock, nb_play, nb_set1, nb_set1, nb_set1, nb_set1, nb_set1, nb_stop, nb_unlock, nb_stop };
+
+static nobuf_t* nobuf_new(DWORD size) {
+    nobuf_t* b = (nobuf_t*)calloc(1, sizeof *b);
+    b->vtbl = g_nobuf_vtbl, b->size = size, b->t0 = GetTickCount();
+    b->mem = (uint8_t*)calloc(1, size ? size : 16);
+    return b;
+}
+
+static HRESULT WINAPI nods_create(void* s, const DWORD* desc, void** o, void* u) {   /* DSBUFFERDESC: size, flags, bytes */
+    (void)s, (void)u;
+    *o = nobuf_new(desc && desc[0] >= 12 && !(desc[1] & 1 /* DSBCAPS_PRIMARYBUFFER */) ? desc[2] : 0x10000);
+    return 0;
+}
+static HRESULT WINAPI nods_caps(void* s, DWORD* c) { (void)s; if (c && c[0] >= 8) memset(c + 1, 0, c[0] - 4); return 0; }
+static HRESULT WINAPI nods_dup(void* s, nobuf_t* a, void** o) { (void)s; *o = nobuf_new(a ? a->size : 0); return 0; }
+static HRESULT WINAPI nods_coop(void* s, HWND w, DWORD l) { (void)s, (void)w, (void)l; return 0; }
+static HRESULT WINAPI nods_compact(void* s) { (void)s; return 0; }
+static HRESULT WINAPI nods_getspk(void* s, DWORD* c) { (void)s; if (c) *c = 0; return 0; }
+static HRESULT WINAPI nods_setspk(void* s, DWORD c) { (void)s, (void)c; return 0; }
+static HRESULT WINAPI nods_init(void* s, const GUID* g) { (void)s, (void)g; return 0; }
+static const void* const g_nods_vtbl[] = { nb_qi, nb_ref, nb_ref, nods_create, nods_caps, nods_dup, nods_coop,
+                                           nods_compact, nods_getspk, nods_setspk, nods_init };
+static const void* g_nods_obj = g_nods_vtbl;            /* an object is a pointer to its vtable */
+#define DSERR_NODRIVER_ 0x88780078u
+
+static void shim_DirectSoundCreate(void) {
+    typedef HRESULT (WINAPI *dscreate_t)(const GUID*, void**, void*);
+    static dscreate_t real;
+    if (!real) real = (dscreate_t)GetProcAddress(LoadLibraryA("dsound.dll"), "DirectSoundCreate");
+    void** out = (void**)(uintptr_t)ARG(1);
+    HRESULT hr = real ? real((const GUID*)(uintptr_t)ARG(0), out, (void*)(uintptr_t)ARG(2)) : DSERR_NODRIVER_;
+    if (FAILED(hr) && out) {
+        printf("[host] DirectSoundCreate -> 0x%08lX: no sound device, the game plays silent\n", (unsigned long)hr);
+        *out = (void*)&g_nods_obj;
+        hr = 0;
+    }
+    g_eax = (uint32_t)hr;
+    g_esp += 4 + 3 * 4;
+}
+
 /* ---- Watcom's longjmp --------------------------------------------------------
  * The game runs its tasks under a setjmp in sub_0043E354; a task ends with
  * longjmp(buf, 3), or 2 to run again. run_lift.py patches the first
@@ -675,7 +757,7 @@ void hotd_longjmp(void) {
  * GetAsyncKeyState and WM_KEYDOWN/WM_KEYUP to its window. Headless, the real
  * keyboard is not read at all, so a run is the same on any machine.
  *
- * The mouse: "m <x> <y>" puts the cursor at a point of the game's 640x480
+ * The mouse: "m <x> <y>" (or "m <x>,<y>") puts the cursor at a point of the game's 640x480
  * picture, and keys 0x01/0x02 are its buttons. Headless, the cursor is the
  * host's own (GetCursorPos/SetCursorPos/ClipCursor below): the real one is
  * never moved or confined. */
@@ -692,17 +774,23 @@ static DWORD WINAPI pad_thread(LPVOID unused) {
     for (;;) {
         Sleep(20);
         char buf[128] = "";
-        HANDLE f = CreateFileA(g_pad, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        /* Read-only first: a writer that shares only reading (netlab's pad
+         * step, .NET's WriteAllText) fails while anyone holds write access,
+         * so write access is taken only to empty a file that has a command. */
+        HANDLE f = CreateFileA(g_pad, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                NULL, OPEN_EXISTING, 0, NULL);
         if (f == INVALID_HANDLE_VALUE) continue;
         DWORD n = 0;
         ReadFile(f, buf, sizeof buf - 1, &n, NULL);
-        if (n) { SetFilePointer(f, 0, NULL, FILE_BEGIN); SetEndOfFile(f); }
         CloseHandle(f);
+        if (!n || (!memchr(buf, '\n', n) && n < 3)) continue;   /* empty, or still being written */
+        f = CreateFileA(g_pad, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, TRUNCATE_EXISTING, 0, NULL);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
         buf[n] = 0;
         if (buf[0] == 'm') {
             char* q = buf + 1;
             g_cur_x = strtol(q, &q, 0);
+            if (*q == ',') q++;                  /* "m X,Y" too: netlab's pad step sends two words */
             g_cur_y = strtol(q, &q, 0);
             g_mouse_step = 2;
             printf("[pad] %6.1fs mouse to %ld,%ld\n", run_seconds(), g_cur_x, g_cur_y);
@@ -797,6 +885,7 @@ static native32_shim_t g_shims[] = {
     { "GlobalFindAtomA", shim_GlobalFindAtomA },
     { "GlobalDeleteAtom", shim_GlobalDeleteAtom },
     { "FindWindowA", shim_FindWindowA },
+    { "DirectSoundCreate", shim_DirectSoundCreate },
     { "CreateMutexA", shim_CreateMutexA },
     { "CreateWindowExA", shim_CreateWindowExA },
     { "ShowWindow", shim_ShowWindow },

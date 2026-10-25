@@ -23,9 +23,9 @@ repository.
 | Arcade mode | chapter 1 plays: zombies, shooting, the HUD, Continue |
 | Cheats (F10) | the game's own cheat mode and Creature Test, held on from the menu |
 | Two players, one PC | the game's own: Mouse, Keyboard, Joystick per player in Options |
-| Online, two players (F10) | lockstep over UDP, LAN or internet, join codes, a desync check; tested with two copies on one PC, not yet across two PCs ([docs/multiplayer.md](docs/multiplayer.md)) |
+| Online, two players (F10) | lockstep over UDP, LAN or internet, join codes, a desync check; tested across two PCs through a NAT and with two copies on one PC ([docs/multiplayer.md](docs/multiplayer.md)) |
 | Light gun | no gun: Sega's `gamebios.dll` is answered "none found"; the mouse aims |
-| Sound | DirectSound; runs are muted unless `--sound`; not yet checked by ear |
+| Sound | DirectSound; runs are muted unless `--sound`; not yet checked by ear. A PC with no audio device plays silent |
 | Played by hand, start to finish | not yet |
 
 ## Getting started

@@ -11,7 +11,8 @@ param([Parameter(Mandatory)][string]$Script, [Parameter(Mandatory)][string]$Out,
       [string]$Exe = 'build\hotd.exe', [Parameter(ValueFromRemainingArguments)][string[]]$Rest)
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
-$pad = Join-Path $Root "$Out.pad"
+if (-not [IO.Path]::IsPathRooted($Out)) { $Out = Join-Path $Root $Out }
+$pad = "$Out.pad"
 Set-Content $pad '' -NoNewline
 $steps = Get-Content $Script | Where-Object { $_ -match '^\s*[\d.]+\s+\S' }
 $job = Start-Job -ArgumentList $pad, $steps -ScriptBlock {
@@ -25,7 +26,9 @@ $job = Start-Job -ArgumentList $pad, $steps -ScriptBlock {
   }
 }
 $hostArgs = @('--run', '--headless', '--watchdog', "$Seconds", '--pad', $pad, '--record', "$Out.mp4") + $Rest
-& $Exe @hostArgs > "$Out.log" 2>&1
+# Through cmd, so the log is the program's own bytes (PowerShell 5's > writes UTF-16).
+$line = (@($Exe -replace '/', '\') + $hostArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+cmd /d /c "$line > `"$Out.log`" 2>&1"
 $code = $LASTEXITCODE
 Stop-Job $job; Remove-Job $job
 Remove-Item $pad -ErrorAction SilentlyContinue
