@@ -19,24 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This licence covers what is actually ours in this repository: the setup
-script, the host runtime, the tools, the analysis summaries and the
-documentation. It does NOT cover The House of the Dead itself.
-
-The House of the Dead is (c) 1996-1998 SEGA, and SEGA owns its
-trademarks. None of it is ours to license. Its
-executables, data, movies, music and art are not in this repository and are
-excluded by .gitignore.
-
-Two consequences worth being explicit about:
-
-  * You need your own copy of the game to use any of this. Its files go in
-    game/; the pipeline reads them from there.
-
-  * Unwrapped and lifted code is a derivative work of the binary it came from.
-    Anything this pipeline emits into work/ or src/recomp/gen/ carries whatever
-    licence the original carries, not this one. The MIT grant above stops at
-    our own work.

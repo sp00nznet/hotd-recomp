@@ -114,5 +114,12 @@ next lift.
 
 ## License
 
-MIT for what's ours (the host, tools and docs); see [LICENSE](LICENSE). The House
-of the Dead is SEGA's.
+[MIT](LICENSE), for what this repository holds: the build and setup files, the
+lift driver, `src/runtime/`, the tools and the documentation.
+
+It does not cover The House of the Dead. The game, its executable, its data,
+art, sound and music are SEGA's. None of them is in this repository; the
+screenshots are of this port running. The C that `run_lift.py` generates from
+`thotd.exe` is a derivative of that executable. It is written into
+`src/recomp/gen/` from your own copy and is never committed, and the MIT licence
+grants nothing in it.
