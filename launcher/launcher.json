@@ -1,0 +1,18 @@
+{
+  "title": "The House of the Dead",
+  "repo": "sp00nznet/hotd-recomp",
+  "accent": "#b3121b",
+  "note": {
+    "windows": "The first build takes 10 to 20 minutes and about 2 GB. Python and the Visual Studio Build Tools are installed if they are missing; the Build Tools are about 3 GB and add 15 to 30 minutes, and Windows asks for permission once. Choose the folder the game is installed in (the one with thotd.exe), or a .zip of it."
+  },
+  "game": {
+    "name": "The House of the Dead",
+    "files": ["thotd.exe|THOTD.EXE|House_of_the_Dead/thotd.exe|*House*Dead*.zip"],
+    "registry": ["HKLM\\SOFTWARE\\WOW6432Node\\Sega\\The House Of The Dead\\path", "HKLM\\SOFTWARE\\Sega\\The House Of The Dead\\path"]
+  },
+  "sources": [{ "repo": "sp00nznet/pcrecomp", "ref": "main", "dir": "pcrecomp" }],
+  "setup": {
+    "windows": ["cmd", "/c", "Setup.cmd", "-Yes", "-GameDir", "{game}"]
+  },
+  "play": "The House of the Dead*"
+}

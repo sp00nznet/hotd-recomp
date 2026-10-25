@@ -1,0 +1,4 @@
+# Skip the demo, start Arcade, then never shoot.
+10 0x20 400
+14 m 318 220
+15 0x01 200
