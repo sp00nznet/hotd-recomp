@@ -1,0 +1,10 @@
+# Player 2 online: join in once Arcade has started, then shoot.
+24 m 400 240
+26 0x01 200
+30 0x01 200
+33 m 300 200
+34 0x01 200
+37 0x01 200
+40 m 350 300
+41 0x01 200
+44 0x01 200

@@ -40,6 +40,7 @@ extern const uint32_t hotd_entry_va;  /* recomp_dispatch.c */
 static DWORD g_watchdog_s;
 static int   g_headless;
 static HWND  g_game_hwnd;   /* the game's first top-level window: --pad posts keys to it */
+static int   g_lockstep;    /* an online session runs in this game (hotd_net_gate) */
 
 /* Seconds since the host started: the same clock as a --record video. */
 static double run_seconds(void) {
@@ -98,6 +99,20 @@ static WNDPROC g_game_proc;
 static LRESULT CALLBACK host_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     LRESULT r;
     if (menu_wndproc(h, m, w, l, &r)) return r;
+    /* Online, a game the other PC can't see must not change: focus comes and
+     * goes on one PC only, and the keyboard and mouse reach the game as the
+     * frame's inputs (hotd_net_gate), never as messages. */
+    if (g_lockstep) {
+        switch (m) {
+        case WM_ACTIVATEAPP: case WM_NCACTIVATE: w = TRUE; break;
+        case WM_ACTIVATE: w = MAKEWPARAM(WA_ACTIVE, HIWORD(w)); break;
+        case WM_KILLFOCUS: return 0;
+        case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR: case WM_SYSCHAR:
+        case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MOUSEWHEEL:
+            return DefWindowProcA(h, m, w, l);
+        }
+    }
     return CallWindowProcA(g_game_proc, h, m, w, l);
 }
 
@@ -276,6 +291,24 @@ static void shim_CreateFileA(void) {
         g_esp += 4 + 7 * 4;
         return;
     }
+    /* Online, player 2 plays with the host's settings (net.c sends them):
+     * its own files are left alone and it reads a copy of the host's. */
+    int len;
+    const char* base = in ? max(strrchr(in, '\\'), strrchr(in, '/')) : NULL;
+    base = base ? base + 1 : in;
+    const uint8_t* session = g_lockstep && !net_is_host() && base ? net_session_file(base, &len) : NULL;
+    if (session) {
+        _snprintf(buf, sizeof buf - 1, "%s\\%s.online", g_game_dir, base);
+        buf[sizeof buf - 1] = 0;
+        static int written[2];
+        int k = !_stricmp(base, "cstats.cfg");
+        if (!written[k]) {
+            FILE* f = fopen(buf, "wb");
+            if (f) fwrite(session, 1, len, f), fclose(f);
+            written[k] = 1;
+        }
+        in = buf;
+    }
     const char* name = cd_path(in, buf, sizeof buf);
     g_eax = (uint32_t)(uintptr_t)CreateFileA(name, ARG(1), ARG(2), (LPSECURITY_ATTRIBUTES)(uintptr_t)ARG(3),
                                              ARG(4), ARG(5), (HANDLE)(uintptr_t)ARG(6));
@@ -358,40 +391,179 @@ static HRESULT WINAPI hk_did_coop(void* self, HWND w, DWORD flags) {
     return g_did_coop(self, w, flags);
 }
 
+/* The mailbox's mouse: "m X Y" is two polls, far up-left into the corner,
+ * then X, Y from there, since the game moves its cursor by relative motion.
+ * ponytail: assumes one count of motion is one pixel; scale here if not. */
+static void mailbox_mouse(DIMOUSESTATE* m) {
+    LONG step = InterlockedExchange(&g_mouse_step, g_mouse_step ? g_mouse_step - 1 : 0);
+    if (step == 2) m->lX = -4000, m->lY = -4000;
+    if (step == 1) m->lX = g_cur_x, m->lY = g_cur_y;
+    m->rgbButtons[0] |= g_pad_down[VK_LBUTTON] ? 0x80 : 0;
+    m->rgbButtons[1] |= g_pad_down[VK_RBUTTON] ? 0x80 : 0;
+}
+
+static void mailbox_keys(uint8_t* kb) {
+    for (int vk = 3; vk < 256; vk++)                 /* past the mouse buttons */
+        if (g_pad_down[vk]) kb[dik_of(vk)] = 0x80;
+}
+
+/* ---- online play: the lockstep's side in the game ------------------------------
+ * net.c moves the inputs; this is where the game meets them (research and
+ * reasoning in docs/multiplayer.md):
+ *
+ *   the gate    run_lift.py patches the top of the input poller, sub_00578100,
+ *               which runs once per frame after the game's logic: hotd_net_gate
+ *               samples this PC's mouse and keyboard, and net_frame returns once
+ *               both players' inputs for the frame are here.
+ *   the poller  then reads DirectInput as always, and the hooks answer with
+ *               the frame's inputs: the keys either player holds, and player
+ *               1's mouse. So both PCs' games compute the same state from it.
+ *   player 2    has a mouse of its own: a shadow of the poller's mouse block
+ *               (0x012FDB80, eight dwords), kept by the same rules, swapped in
+ *               around player 2's reader (sub_0043591C from 0x00436678) and its
+ *               start check (0x0041914C). Both players are set to Mouse.
+ *   the clock   timeGetTime is the real one until the game's frame timer first
+ *               asks (sub_00578930, after the boot's display benchmark), then a
+ *               shared one from the host's base: 1 ms a read, and at least
+ *               17 ms a frame. */
+static void* g_kbd_dev, *g_mouse_dev;    /* the game's devices, for sampling */
+static net_input_t g_both[2];           /* the frame's inputs */
+static uint32_t g_p2m[8];               /* player 2's mouse block */
+static uint32_t g_p1m_saved[8];
+static int g_p2_swapped;
+#define MOUSE_BLOCK 0x012FDB80u
+#define P2_RECORD   (0x00D9F058u + 0xCCu)
+
+static int g_vclock_on;                 /* the shared clock has begun */
+static uint32_t g_vclock, g_vclock_f0;
+
+static uint32_t now_ms(int tick_count) {
+    if (!g_lockstep) return tick_count ? GetTickCount() : timeGetTime();
+    if (!g_vclock_on && g_cur_func == 0x00578930u) {
+        g_vclock_on = 1;
+        g_vclock = net_clock_base();
+        fprintf(stderr, "[net] the shared clock starts at %u\n", g_vclock);
+    }
+    return g_vclock_on ? ++g_vclock : (tick_count ? GetTickCount() : timeGetTime());
+}
+
+static void shim_timeGetTime(void) { g_eax = now_ms(0); g_esp += 4; }
+static void shim_GetTickCount(void) { g_eax = now_ms(1); g_esp += 4; }
+
+static void pack_input(net_input_t* in, const uint8_t* kb, const DIMOUSESTATE* m) {
+    memset(in, 0, sizeof *in);
+    in->dx = (int16_t)max(-32768, min(32767, m->lX));
+    in->dy = (int16_t)max(-32768, min(32767, m->lY));
+    for (int b = 0; b < 3; b++) in->buttons |= (m->rgbButtons[b] & 0x80) ? 1 << b : 0;
+    for (int k = 1; k < 256 && in->nkeys < NET_KEYS; k++)
+        if (kb[k] & 0x80) in->keys[in->nkeys++] = (uint8_t)k;
+}
+
+/* The poller's mouse rules (sub_00578100 from 0x0057827D), for player 2's block. */
+static void mouse_block_step(uint32_t* b, const net_input_t* in) {
+    b[3] = b[0];                                            /* previous buttons */
+    b[0] = in->buttons;
+    b[6] = (uint32_t)(int32_t)in->dx, b[7] = (uint32_t)(int32_t)in->dy;
+    int32_t x = (int32_t)b[4] + in->dx, y = (int32_t)b[5] + in->dy;
+    int32_t w = (int32_t)MEM32(0x00C64A3Cu), h = (int32_t)MEM32(0x00C64A40u);
+    x = x < 0 ? 0 : x >= w ? w - 1 : x;
+    y = y < 0 ? 0 : y >= h ? h - 1 : y;
+    b[4] = (uint32_t)x, b[5] = (uint32_t)y;
+    uint32_t changed = b[0] ^ b[3];
+    b[1] = changed & b[0], b[2] = changed & b[3];         /* presses, releases */
+}
+
+void hotd_net_gate(void) {
+    if (!g_lockstep) return;
+    uint8_t kb[256] = { 0 };
+    DIMOUSESTATE m = { 0 };
+    if (!g_headless && GetForegroundWindow() == g_game_hwnd) {   /* only a player at this window plays */
+        if (g_kbd_dev && FAILED(g_did_getstate(g_kbd_dev, sizeof kb, kb))) memset(kb, 0, sizeof kb);
+        if (g_mouse_dev && FAILED(g_did_getstate(g_mouse_dev, sizeof m, &m))) memset(&m, 0, sizeof m);
+    }
+    mailbox_keys(kb);
+    mailbox_mouse(&m);
+    net_input_t mine;
+    pack_input(&mine, kb, &m);
+    int32_t f = net_frame_no();
+    if (!net_frame(&mine, g_both)) {                       /* the session ended: play on alone */
+        memset(g_both, 0, sizeof g_both);
+        g_both[net_seat()] = mine;
+    }
+    if (f == 0) memcpy(g_p2m, (void*)(uintptr_t)MOUSE_BLOCK, sizeof g_p2m);   /* player 2 starts where 1 does */
+    mouse_block_step(g_p2m, &g_both[1]);
+    MEM32(0x00D5B200u) = 0, MEM32(0x00D5B204u) = 0;         /* both players: Mouse */
+    menu_apply_cheats();                                    /* the host's, on the same frame on both */
+    if (g_vclock_on) {
+        if (f == 0) g_vclock_f0 = g_vclock;
+        if (g_vclock < g_vclock_f0 + 17u * (uint32_t)f) g_vclock = g_vclock_f0 + 17u * (uint32_t)f;
+    }
+    /* The desync check: what both games' logic computed from the same inputs,
+     * the two players' input records and player records (aim, life, ammo,
+     * score) and the game's own random seed. */
+    uint32_t hsh = 2166136261u;
+    for (uint32_t a = 0x00D9F5E0u; a < 0x00D9F5E0u + 2 * 0x1C; a++) hsh = (hsh ^ MEM8(a)) * 16777619u;
+    for (uint32_t a = 0x00D9F058u; a < 0x00D9F058u + 2 * 0xCC; a++) {
+        uint32_t o = (a - 0x00D9F058u) % 0xCC;      /* +0xA8, +0xC0: pointers into each PC's own heap */
+        if ((o >= 0xA8 && o < 0xAC) || (o >= 0xC0 && o < 0xC4)) continue;
+        hsh = (hsh ^ MEM8(a)) * 16777619u;
+    }
+    hsh = (hsh ^ MEM32(0x00DA10F0u)) * 16777619u;
+    net_set_hash(hsh);
+}
+
+/* Around player 2's reader and start check (run_lift.py PATCHES). */
+void hotd_p2_in(uint32_t record) {
+    if (!g_lockstep || record != P2_RECORD || g_p2_swapped) return;
+    memcpy(g_p1m_saved, (void*)(uintptr_t)MOUSE_BLOCK, sizeof g_p1m_saved);
+    memcpy((void*)(uintptr_t)MOUSE_BLOCK, g_p2m, sizeof g_p2m);
+    g_p2_swapped = 1;
+}
+
+void hotd_p2_out(void) {
+    if (!g_p2_swapped) return;
+    memcpy(g_p2m, (void*)(uintptr_t)MOUSE_BLOCK, sizeof g_p2m);   /* what the reader left, kept */
+    memcpy((void*)(uintptr_t)MOUSE_BLOCK, g_p1m_saved, sizeof g_p1m_saved);
+    g_p2_swapped = 0;
+}
+
 static HRESULT WINAPI hk_did_getstate(void* self, DWORD cb, void* data) {
     static DWORD sizes[4];
     for (int i = 0; i < 4 && sizes[i] != cb; i++)
         if (!sizes[i]) { sizes[i] = cb; printf("[input] the game polls GetDeviceState (%lu bytes)\n", cb); break; }
+    if (g_lockstep) {                                       /* the frame's inputs, the same on both PCs */
+        memset(data, 0, cb);
+        if (cb == 256)
+            for (int p = 0; p < 2; p++)
+                for (int k = 0; k < g_both[p].nkeys; k++) ((uint8_t*)data)[g_both[p].keys[k]] = 0x80;
+        if (cb == sizeof(DIMOUSESTATE) || cb == 20) {
+            DIMOUSESTATE* m = (DIMOUSESTATE*)data;
+            m->lX = g_both[0].dx, m->lY = g_both[0].dy;
+            for (int b = 0; b < 3; b++) m->rgbButtons[b] = (g_both[0].buttons >> b & 1) ? 0x80 : 0;
+        }
+        return DI_OK;
+    }
     HRESULT hr = g_did_getstate(self, cb, data);
     if (g_headless || FAILED(hr)) memset(data, 0, cb), hr = DI_OK;   /* the real devices stay out */
-    if (cb == sizeof(DIMOUSESTATE) || cb == 20) {   /* the mouse: the mailbox's moves and buttons */
-        /* The game moves its cursor by the relative motion, so "m X Y" is two
-         * polls: far up-left into the corner, then X, Y from there.
-         * ponytail: assumes one count of motion is one pixel; scale here if not. */
-        LONG step = InterlockedExchange(&g_mouse_step, g_mouse_step ? g_mouse_step - 1 : 0);
-        if (step == 2) ((DIMOUSESTATE*)data)->lX = -4000, ((DIMOUSESTATE*)data)->lY = -4000;
-        if (step == 1) ((DIMOUSESTATE*)data)->lX = g_cur_x, ((DIMOUSESTATE*)data)->lY = g_cur_y;
-        ((DIMOUSESTATE*)data)->rgbButtons[0] |= g_pad_down[VK_LBUTTON] ? 0x80 : 0;
-        ((DIMOUSESTATE*)data)->rgbButtons[1] |= g_pad_down[VK_RBUTTON] ? 0x80 : 0;
-    }
-    if (cb == 256)                           /* the keyboard */
-        for (int vk = 1; vk < 256; vk++)
-            if (g_pad_down[vk]) ((uint8_t*)data)[dik_of(vk)] = 0x80;
+    if (cb == sizeof(DIMOUSESTATE) || cb == 20) mailbox_mouse((DIMOUSESTATE*)data);
+    if (cb == 256) mailbox_keys((uint8_t*)data);
     return hr;
 }
 
 /* Buffered reads: a mailbox key's press and release, as the records a real
- * keyboard would have queued. */
+ * keyboard would have queued. Online the game gets none: every input is the
+ * frame's (above). */
 static HRESULT WINAPI hk_did_getdata(void* self, DWORD cb, DIDEVICEOBJECTDATA* d, DWORD* n, DWORD f) {
     static uint8_t seen[256];
     static void* devs[4];
     for (int i = 0; i < 4 && devs[i] != self; i++)
         if (!devs[i]) { devs[i] = self; printf("[input] device %p polls GetDeviceData (%lu-byte records)\n", self, cb); break; }
+    if (g_lockstep) { if (n) *n = 0; return DI_OK; }
     DWORD room = n ? *n : 0;
     HRESULT hr = g_did_getdata(self, cb, d, n, f);
     if ((g_headless || FAILED(hr)) && n) *n = 0, hr = DI_OK;
     if (!d || !n || (f & DIGDD_PEEK)) return hr;
-    for (int vk = 1; vk < 256 && *n < room; vk++) {
+    for (int vk = 3; vk < 256 && *n < room; vk++) {
         if (seen[vk] == g_pad_down[vk]) continue;
         seen[vk] = g_pad_down[vk];
         DIDEVICEOBJECTDATA* r = (DIDEVICEOBJECTDATA*)((uint8_t*)d + *n * cb);
@@ -407,6 +579,8 @@ static HRESULT WINAPI hk_did_getdata(void* self, DWORD cb, DIDEVICEOBJECTDATA* d
 static HRESULT WINAPI hk_di_createdev(void* self, const GUID* g, void** dev, void* outer) {
     HRESULT hr = g_di_createdev(self, g, dev, outer);
     if (hr == 0 && *dev) {
+        if (IsEqualGUID(g, &GUID_SysKeyboard)) g_kbd_dev = *dev;
+        if (IsEqualGUID(g, &GUID_SysMouse)) g_mouse_dev = *dev;
         patch_slot(*dev, 13, (void*)hk_did_coop, (void**)&g_did_coop);
         patch_slot(*dev, 9, (void*)hk_did_getstate, (void**)&g_did_getstate);
         patch_slot(*dev, 10, (void*)hk_did_getdata, (void**)&g_did_getdata);
@@ -571,7 +745,8 @@ static void shim_GetAsyncKeyState(void) {
     int vk = (int)ARG(0) & 0xFF;
     static uint8_t seen[256];             /* each key the game polls, once: what it reads */
     if (!seen[vk]) seen[vk] = 1, printf("[pad] the game polls key 0x%02X\n", vk);
-    SHORT s = g_headless ? 0 : GetAsyncKeyState(vk);
+    SHORT s = g_headless || g_lockstep ? 0 : GetAsyncKeyState(vk);   /* online: only the frame's inputs */
+    if (g_lockstep) { g_eax = 0; g_esp += 4 + 1 * 4; return; }
     if (g_pad_down[vk]) s |= (SHORT)0x8000;
     g_eax = (uint16_t)s;
     g_esp += 4 + 1 * 4;
@@ -609,6 +784,8 @@ static void shim_ClipCursor(void) {
 static native32_shim_t g_shims[] = {
     { "GetAsyncKeyState", shim_GetAsyncKeyState },
     { "GetCursorPos", shim_GetCursorPos },
+    { "timeGetTime", shim_timeGetTime },
+    { "GetTickCount", shim_GetTickCount },
     { "SetCursorPos", shim_SetCursorPos },
     { "ClipCursor", shim_ClipCursor },
     { "gbInitDeviceDriver", shim_gbInitDeviceDriver },
@@ -769,6 +946,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--host")) net_host_port = i + 1 < argc && atoi(argv[i + 1]) ? atoi(argv[++i]) : -1;
         else if (!strcmp(argv[i], "--join") && i + 1 < argc) net_join_addr = argv[++i];
         else if (!strcmp(argv[i], "--net-selftest")) net_test = 1;
+        else if (!strcmp(argv[i], "--desync-test") && i + 1 < argc) g_net_desync_test = atoi(argv[++i]);
         else {
             printf("usage: hotd [--run] [--headless] [--record out.mp4] [--fullscreen] [--sound] [--exe work\\thotd.exe]\n"
                    "            [--game game] [--args \"<game switches>\"] [--watchdog S] [--pad FILE] [--callbacks]\n"
@@ -825,6 +1003,12 @@ int main(int argc, char** argv) {
     }
     printf("  entering 0x%08X\n\n", hotd_entry_va);
     fflush(stdout);
+    /* Online: the game starts once the other PC is here, so both start from
+     * the same first frame. Given up, it starts alone. */
+    if (net_host_port || net_join_addr) {
+        g_lockstep = net_wait();
+        printf("  online: %s\n", g_lockstep ? net_status() : "no session, playing alone");
+    }
     native32_call_guest(hotd_entry_va, 0, NULL);
     ddw_close();
     printf("\nentry returned eax=%08X\n", g_eax);

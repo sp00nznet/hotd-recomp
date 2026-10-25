@@ -27,6 +27,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <mmsystem.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,8 +48,13 @@ enum { T_HELLO = 1, T_WELCOME, T_INPUT, T_HASH, T_BYE };
 
 #pragma pack(push, 1)
 typedef struct { uint32_t magic; uint8_t type, version; } hdr_t;
-typedef struct { hdr_t h; uint32_t stamp; } hello_t;
-typedef struct { hdr_t h; uint32_t stamp; int32_t cheats; } welcome_t;
+typedef struct { hdr_t h; uint32_t stamp, now; } hello_t;          /* now: its clock, for the shared one */
+/* The session: the host's cheats and the two files that change how the game
+ * plays (thotd.cfg: difficulty, lives, continues, controls; cstats.cfg: the
+ * character stats), so both PCs play the same game. */
+#define SESSION_FILE_MAX 512
+typedef struct { hdr_t h; uint32_t stamp; int32_t cheats; uint32_t clock; uint16_t ncfg, ncstats;
+                 uint8_t data[2 * SESSION_FILE_MAX]; } welcome_t;
 typedef struct { hdr_t h; int32_t first; uint8_t n; net_input_t in[REDUND]; } input_t;
 typedef struct { hdr_t h; int32_t frame; uint32_t hash; } hash_t;
 #pragma pack(pop)
@@ -64,6 +70,10 @@ static char     g_status[160] = "offline";
 static volatile DWORD g_seen;          /* the last packet from the peer */
 static HWND     g_frame_hwnd;
 static int      g_headless;
+static uint8_t  g_file[2][512];        /* the session's thotd.cfg and cstats.cfg */
+static int      g_file_len[2];
+static volatile uint32_t g_clock_base;  /* the shared clock starts here (host.c) */
+static const char* const k_files[2] = { "thotd.cfg", "cstats.cfg" };
 
 /* The input ring: [seat][frame & (RING-1)], with the frame it holds. */
 static net_input_t g_in[2][RING];
@@ -125,6 +135,7 @@ static void got_hash(const hash_t* p, int seat) {
     g_hash[seat][k] = p->hash, g_hash_frame[seat][k] = p->frame;
     int mine = g_hash_frame[!seat][k] == p->frame, differ = mine && g_hash[!seat][k] != p->hash;
     LeaveCriticalSection(&g_lock);
+    if (mine && !differ && p->frame % 600 == 0) fprintf(stderr, "[net] frame %d: the two games agree\n", p->frame);
     if (differ) {
         char why[96];
         _snprintf(why, sizeof why - 1, "the two games went apart at frame %d (desync): session ended", p->frame);
@@ -141,7 +152,9 @@ static DWORD WINAPI recv_thread(LPVOID unused) {
         int fl = sizeof from;
         int n = recvfrom(g_sock, buf, sizeof buf, 0, (struct sockaddr*)&from, &fl);
         if (n == SOCKET_ERROR) {
-            if (WSAGetLastError() == WSAECONNRESET) continue;   /* an ICMP for an old send */
+            int e = WSAGetLastError();
+            if (e == WSAECONNRESET || e == WSAEMSGSIZE) continue;   /* an ICMP for an old send; a stray */
+            status("receiving stopped (socket error %d)", e);
             return 0;
         }
         const hdr_t* h = (const hdr_t*)buf;
@@ -159,6 +172,7 @@ static DWORD WINAPI recv_thread(LPVOID unused) {
         int remote = g_is_host ? 1 : 0;
         switch (h->type) {
         case T_HELLO:
+            if (!g_have_peer) fprintf(stderr, "[net] HELLO (%d bytes)\n", n);
             if (!g_is_host || n < (int)sizeof(hello_t)) break;
             if (((const hello_t*)buf)->stamp != g_stamp) {
                 status("a player tried to join with a different thotd.exe");
@@ -173,19 +187,34 @@ static DWORD WINAPI recv_thread(LPVOID unused) {
             {
                 welcome_t w;
                 hdr(&w, T_WELCOME);
-                w.stamp = g_stamp, w.cheats = menu_cheats();
-                send_peer(&w, sizeof w);
+                /* Past both PCs' clocks, so no timer sees time go backwards. */
+                if (!g_clock_base) {
+                    uint32_t mine = timeGetTime(), theirs = ((const hello_t*)buf)->now;
+                    g_clock_base = (mine > theirs ? mine : theirs) + 60000;
+                }
+                w.stamp = g_stamp, w.cheats = menu_cheats(), w.clock = g_clock_base;
+                w.ncfg = (uint16_t)g_file_len[0], w.ncstats = (uint16_t)g_file_len[1];
+                memcpy(w.data, g_file[0], w.ncfg);
+                memcpy(w.data + w.ncfg, g_file[1], w.ncstats);
+                send_peer(&w, (int)offsetof(welcome_t, data) + w.ncfg + w.ncstats);
             }
             g_active = 1;
             break;
         case T_WELCOME:
-            if (g_is_host || n < (int)sizeof(welcome_t)) break;
+            if (g_is_host || n < (int)offsetof(welcome_t, data)) break;
             if (!g_active) {
                 if (((const welcome_t*)buf)->stamp != g_stamp) {
                     status("the host has a different thotd.exe: cannot play together");
                     break;
                 }
-                menu_set_cheats(((const welcome_t*)buf)->cheats);
+                const welcome_t* w = (const welcome_t*)buf;
+                if (w->ncfg > SESSION_FILE_MAX || w->ncstats > SESSION_FILE_MAX ||
+                    (int)offsetof(welcome_t, data) + w->ncfg + w->ncstats > n) break;
+                menu_set_cheats(w->cheats);
+                g_clock_base = w->clock;
+                g_file_len[0] = w->ncfg, g_file_len[1] = w->ncstats;
+                memcpy(g_file[0], w->data, w->ncfg);
+                memcpy(g_file[1], w->data + w->ncfg, w->ncstats);
                 g_active = 1;
                 status("joined: you are player 2");
             }
@@ -284,12 +313,12 @@ static DWORD WINAPI hello_thread(LPVOID unused) {
     (void)unused;
     hello_t b;
     hdr(&b, T_HELLO);
-    b.stamp = g_stamp;
-    for (int k = 0; k < 40 && !g_active && !g_ended; k++) {   /* 20 s of asking */
+    b.stamp = g_stamp, b.now = timeGetTime();
+    for (int k = 0; !g_active && !g_ended; k++) {   /* until it answers, or the player gives up */
         send_peer(&b, sizeof b);
+        if (k == 20) status("no answer yet from the host: is the game hosting, and the UDP port open?");
         Sleep(500);
     }
-    if (!g_active) status("no answer from the host");
     return 0;
 }
 
@@ -375,9 +404,12 @@ int net_frame(const net_input_t* mine, net_input_t both[2]) {
     return 1;
 }
 
+int32_t g_net_desync_test = -1;         /* --desync-test FRAME: this PC's hash lies there */
+
 void net_set_hash(uint32_t hash) {
     int32_t f = g_frame - 1;
     if (!g_active || f % HASH_EVERY) return;
+    if (g_net_desync_test >= 0 && f >= g_net_desync_test) hash ^= 1;
     hash_t p;
     hdr(&p, T_HASH);
     p.frame = f, p.hash = hash;
@@ -386,8 +418,12 @@ void net_set_hash(uint32_t hash) {
 }
 
 int32_t net_frame_no(void) { return g_frame; }
+uint32_t net_clock_base(void) { return g_clock_base; }
 
-/* ---- the F10 menu ----------------------------------------------------------- */
+/* ---- the F10 menu ----------------------------------------------------------- *
+ * A session begins at the game's first frame on both PCs (two games that
+ * started at different times can't be lined up), so Host and Join start the
+ * game again, into one: this program with --host, or --join and the address. */
 enum { ID_HOST, ID_CODE, ID_JOIN, ID_LEAVE };
 
 void net_menu(HMENU m, UINT first) {
@@ -397,12 +433,13 @@ void net_menu(HMENU m, UINT first) {
     AppendMenuA(m, MF_STRING | MF_GRAYED, 0, t);
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     UINT idle = g_sock == INVALID_SOCKET ? 0 : MF_GRAYED;
-    _snprintf(t, sizeof t - 1, "&Host a game (you are player 1, UDP port %d)", g_port);
+    _snprintf(t, sizeof t - 1, "&Host a game (restarts the game; you are player 1, UDP port %d)", g_port);
     t[sizeof t - 1] = 0;
     AppendMenuA(m, MF_STRING | idle, first + ID_HOST, t);
     AppendMenuA(m, MF_STRING | (g_is_host && g_sock != INVALID_SOCKET ? 0 : MF_GRAYED), first + ID_CODE,
                 "&Copy the join code");
-    AppendMenuA(m, MF_STRING | idle, first + ID_JOIN, "&Join a game (the join code or address on the clipboard)");
+    AppendMenuA(m, MF_STRING | idle, first + ID_JOIN,
+                "&Join a game (restarts the game; the join code or address on the clipboard)");
     AppendMenuA(m, MF_STRING | (g_active ? 0 : MF_GRAYED), first + ID_LEAVE, "&Leave the online game");
 }
 
@@ -423,44 +460,117 @@ static void show(const char* msg) {
     if (!g_headless) MessageBoxA(g_frame_hwnd, msg, "The House of the Dead online", MB_OK | MB_ICONINFORMATION);
 }
 
+/* This program again, with the same command line plus `extra`, then this one ends. */
+static void restart_with(const char* extra) {
+    char cmd[2048];
+    _snprintf(cmd, sizeof cmd - 1, "%s %s", GetCommandLineA(), extra);
+    cmd[sizeof cmd - 1] = 0;
+    STARTUPINFOA si = { sizeof si };
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        show("Could not start the game again for the online session.");
+        return;
+    }
+    CloseHandle(pi.hProcess), CloseHandle(pi.hThread);
+    ExitProcess(0);
+}
+
+static void put_code(void) {
+    char code[32];
+    net_encode(best_address(), g_port, code, sizeof code);
+    clip_put(code);
+}
+
 void net_command(int id) {
     const char* ini = menu_ini();
     if (id == ID_HOST) {
-        if (net_host(GetPrivateProfileIntA("net", "port", 7797, ini))) net_command(ID_CODE);
-        else show(g_status);
+        restart_with("--host");
     } else if (id == ID_CODE) {
-        char code[32], msg[400], ip[64] = "?";
-        uint32_t a = best_address();
-        inet_ntop(AF_INET, &a, ip, sizeof ip);
-        net_encode(a, g_port, code, sizeof code);
-        clip_put(code);
-        _snprintf(msg, sizeof msg - 1,
-                  "Join code %s (%s, UDP port %d) is on the clipboard.\n\n"
-                  "Player 2 copies it and chooses F10, Online, Join. Over the internet, forward UDP port %d "
-                  "to this PC (or both use Tailscale).\n\nThen start a game: player 2 presses Start to join in.",
-                  code, ip, g_port, g_port);
-        msg[sizeof msg - 1] = 0;
-        show(msg);
+        put_code();
+        show("The join code is on the clipboard.");
     } else if (id == ID_JOIN) {
-        char a[96] = "";
+        char a[96] = "", arg[128];
         if (OpenClipboard(NULL)) {                /* a code or address someone pasted wins over the ini */
             HANDLE h = GetClipboardData(CF_TEXT);
             const char* p = h ? (const char*)GlobalLock(h) : NULL;
             if (p && strlen(p) < sizeof a) {
                 strcpy(a, p);
                 for (char* e = a + strlen(a); e > a && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ');) *--e = 0;
-                if (strchr(a, ' ') || !(strchr(a, '.') || strchr(a, ':') || !_strnicmp(a, "HOTD-", 5))) a[0] = 0;
+                if (strchr(a, ' ') || strchr(a, '"') || !(strchr(a, '.') || strchr(a, ':') || !_strnicmp(a, "HOTD-", 5)))
+                    a[0] = 0;
             }
             if (p) GlobalUnlock(h);
             CloseClipboard();
         }
         if (!a[0]) GetPrivateProfileStringA("net", "join", "", a, sizeof a, ini);
-        if (!a[0]) { show("Copy the host's join code (HOTD-XXXXX-XXXXX) or address, then choose Join again."); return; }
+        if (!a[0] || strchr(a, '"')) { show("Copy the host's join code (HOTD-XXXXX-XXXXX) or address, then choose Join again."); return; }
         WritePrivateProfileStringA("net", "join", a, ini);
-        if (!net_join(a)) show(g_status);
+        _snprintf(arg, sizeof arg - 1, "--join \"%s\"", a);
+        arg[sizeof arg - 1] = 0;
+        restart_with(arg);
     } else if (id == ID_LEAVE) {
         net_leave();
     }
+}
+
+/* ---- before the game starts ------------------------------------------------- */
+static void read_session_files(void) {
+    for (int i = 0; i < 2; i++) {
+        FILE* f = fopen(k_files[i], "rb");
+        g_file_len[i] = f ? (int)fread(g_file[i], 1, sizeof g_file[i], f) : 0;
+        if (f) fclose(f);
+    }
+}
+
+const uint8_t* net_session_file(const char* name, int* len) {
+    for (int i = 0; i < 2; i++)
+        if (!_stricmp(name, k_files[i]) && g_file_len[i]) { *len = g_file_len[i]; return g_file[i]; }
+    return NULL;
+}
+
+static LRESULT CALLBACK wait_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_CLOSE) { DestroyWindow(h); return 0; }
+    return DefWindowProcA(h, m, w, l);
+}
+
+int net_wait(void) {
+    if (g_sock == INVALID_SOCKET) return 0;
+    if (g_is_host) {
+        read_session_files();
+        put_code();
+    }
+    HWND w = NULL, text = NULL;
+    if (!g_headless) {
+        WNDCLASSA c = { 0 };
+        c.lpfnWndProc = wait_proc, c.hInstance = GetModuleHandleA(NULL), c.lpszClassName = "hotd_net_wait";
+        c.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1), c.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
+        RegisterClassA(&c);
+        w = CreateWindowExA(WS_EX_TOPMOST, c.lpszClassName, "The House of the Dead online",
+                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 520, 170,
+                            NULL, NULL, c.hInstance, NULL);
+        text = CreateWindowExA(0, "STATIC", "", WS_CHILD | WS_VISIBLE, 16, 16, 480, 100, w, NULL, c.hInstance, NULL);
+    }
+    char shown[400] = "";
+    while (!g_active) {
+        if (g_headless) { Sleep(50); if (g_ended) return 0; continue; }
+        if (!IsWindow(w)) { net_leave(); return 0; }   /* closed: no online game */
+        char t[400], code[32];
+        net_encode(best_address(), g_port, code, sizeof code);
+        if (g_is_host)
+            _snprintf(t, sizeof t - 1, "Waiting for player 2.\n\nJoin code: %s (on your clipboard)\n\n"
+                      "Over the internet, forward UDP port %d to this PC, or both use Tailscale. "
+                      "Close this window to give up.", code, g_port);
+        else
+            _snprintf(t, sizeof t - 1, "%s\n\nClose this window to give up.", g_status);
+        t[sizeof t - 1] = 0;
+        if (strcmp(t, shown)) SetWindowTextA(text, t), strcpy(shown, t);
+        MSG msg;
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+        Sleep(30);
+    }
+    if (w && IsWindow(w)) DestroyWindow(w);
+    status("%s: you are player %d", g_is_host ? "player 2 is here" : "joined", net_seat() + 1);
+    return 1;
 }
 
 /* ---- setting up ------------------------------------------------------------- */

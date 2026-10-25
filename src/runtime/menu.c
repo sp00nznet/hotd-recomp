@@ -40,14 +40,20 @@ static char g_ini[MAX_PATH];
  * typed, so they are put back every 100 ms. Turning one off clears it once.
  * Online, the cheats are the host's, sent with the session (net.c), so every
  * PC plays the same game. */
+void menu_apply_cheats(void) {
+    LONG clear = InterlockedExchange(&g_clear, 0);
+    for (int i = 0; i < NCHEATS; i++) {
+        if (clear >> i & 1) MEM8(k_cheats[i].va) = 0;
+        else if (g_on[i] && !MEM8(k_cheats[i].va)) MEM8(k_cheats[i].va) = 1;
+    }
+}
+
+/* Online the gate applies them once a frame instead (hotd_net_gate): a write
+ * at a moment the other PC doesn't share would set the two games apart. */
 static DWORD WINAPI cheat_thread(LPVOID unused) {
     (void)unused;
     for (;;) {
-        LONG clear = InterlockedExchange(&g_clear, 0);
-        for (int i = 0; i < NCHEATS; i++) {
-            if (clear >> i & 1) MEM8(k_cheats[i].va) = 0;
-            else if (g_on[i] && !MEM8(k_cheats[i].va)) MEM8(k_cheats[i].va) = 1;
-        }
+        if (!net_active()) menu_apply_cheats();
         Sleep(100);
     }
 }
@@ -66,8 +72,8 @@ void menu_set_cheats(int bits) {
 }
 
 static void toggle_cheat(int i) {
-    if (net_active() && !net_is_host()) {
-        fprintf(stderr, "[menu] online, the host sets the cheats\n");
+    if (net_active()) {                        /* one PC's change alone would set the games apart */
+        fprintf(stderr, "[menu] online, the cheats are the host's from the start\n");
         return;
     }
     g_on[i] = !g_on[i];
@@ -107,7 +113,7 @@ static void run(int cmd) {
 
 static void show(HWND h) {
     HMENU m = CreatePopupMenu(), ch = CreatePopupMenu(), nm = CreatePopupMenu();
-    int locked = net_active() && !net_is_host();
+    int locked = net_active();                 /* online: the host's, set before the game */
     for (int i = 0; i < NCHEATS; i++) add(ch, ID_CHEAT + i, k_cheats[i].name, g_on[i], !locked);
     AppendMenuA(ch, MF_SEPARATOR, 0, NULL);
     add(ch, 0, "With cheat mode: Ctrl+R rapid fire, Ctrl+1/2 invulnerability", 0, 0);

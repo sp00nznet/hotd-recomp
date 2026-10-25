@@ -22,6 +22,8 @@ repository.
 | Menus | main menu, by mouse |
 | Arcade mode | chapter 1 plays: zombies, shooting, the HUD, Continue |
 | Cheats (F10) | the game's own cheat mode and Creature Test, held on from the menu |
+| Two players, one PC | the game's own: Mouse, Keyboard, Joystick per player in Options |
+| Online, two players (F10) | lockstep over UDP, LAN or internet, join codes, a desync check; tested with two copies on one PC, not yet across two PCs ([docs/multiplayer.md](docs/multiplayer.md)) |
 | Light gun | no gun: Sega's `gamebios.dll` is answered "none found"; the mouse aims |
 | Sound | DirectSound; runs are muted unless `--sound`; not yet checked by ear |
 | Played by hand, start to finish | not yet |
@@ -75,6 +77,13 @@ player (Keyboard, Joystick) for two players on one PC.
 
 ![The main menu with cheat mode on](docs/screenshots/cheat-menu.png)
 
+- *Online (2 players)*: **Host a game** restarts the game and waits for player 2,
+  with a join code (`HOTD-XXXXX-XXXXX`) on the clipboard; player 2 copies it
+  and chooses **Join a game**. Both play with the mouse, player 2 clicks to join
+  in, and the host's settings and cheats are the session's. Over the internet
+  the host forwards UDP port 7797 (or both use Tailscale). How it works:
+  [docs/multiplayer.md](docs/multiplayer.md).
+
 ## What it took
 
 Beyond the shared pipeline:
@@ -98,7 +107,8 @@ Beyond the shared pipeline:
 input mailbox: `0x20 400` holds Space for 400 ms, `m 318 220` moves the cursor to
 a point of the 640x480 picture, `0x01` clicks. `tools\drive.ps1` plays a timeline
 of those (`tools\scripts\arcade.txt` starts Arcade mode), and `--cmd cheat@1`
-runs an F10 command at a time. A function the catalog missed shows up as
+runs an F10 command at a time. `--host [PORT]` and `--join CODE|ADDR[:PORT]` start an
+online session; `--desync-test FRAME` checks the desync check. A function the catalog missed shows up as
 `ICALL: unresolved VA`; `py -3 tools\seed_from_log.py run.log` seeds it for the
 next lift.
 

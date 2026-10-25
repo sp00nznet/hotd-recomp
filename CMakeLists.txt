@@ -31,6 +31,7 @@ add_executable(hotd
   src/runtime/ddraw_window.c
   src/runtime/menu.c
   src/runtime/net.c
+  src/runtime/hotd.manifest
   ${PCRECOMP}/runtime/native32/native32.c
   ${PCRECOMP}/runtime/recomp32/image_loader.c
   ${PCRECOMP}/runtime/recomp32/recomp_trace.c

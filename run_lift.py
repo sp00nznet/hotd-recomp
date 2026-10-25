@@ -73,8 +73,18 @@ PATCHES = {
     # from the jmp_buf, then back into the frame that called setjmp
     # (hotd_longjmp in host.c, recomp_eh_resume in pcrecomp's eh32.c).
     0x00579783: 'RECOMP_REGS_OUT(); hotd_longjmp();',
+    # Online play (host.c, docs/multiplayer.md). The input poller runs once a
+    # frame: the lockstep's gate is its first instruction.
+    0x00578100: 'hotd_net_gate();',
+    # Player 2's mouse is a block of its own, swapped in for player 2's
+    # reader (sub_0043591C, ebx the player's record) and start check.
+    0x00436676: 'hotd_p2_in(ebx);',
+    0x00436678: 'hotd_p2_out();',
+    0x00419147: 'hotd_p2_in(0x00D9F124u);',
+    0x0041914C: 'hotd_p2_out();',
 }
-PATCH_DECLS = 'void hotd_longjmp(void);\n'
+PATCH_DECLS = ('void hotd_longjmp(void);\nvoid hotd_net_gate(void);\n'
+               'void hotd_p2_in(uint32_t record);\nvoid hotd_p2_out(void);\n')
 
 # Watcom's setjmp. Each call to it gets a landing pad: a label just after the
 # call, which the host's longjmp resumes at. recomp_dispatch.c lists them as
